@@ -1,0 +1,29 @@
+# --- Gradle ---
+.gradle/
+build/
+out/
+gradle/wrapper/gradle-wrapper.jar
+
+# --- IntelliJ IDEA ---
+.idea/
+*.iws
+*.iml
+*.ipr
+out/
+
+# --- Eclipse / VS Code (Java Extension) ---
+.classpath
+.project
+.settings/
+.factorypath
+bin/
+
+# --- Mac OS (시스템 파일) ---
+.DS_Store
+
+# --- Logs ---
+*.log
+logs/
+
+# --- Spring Boot ---
+help.md
