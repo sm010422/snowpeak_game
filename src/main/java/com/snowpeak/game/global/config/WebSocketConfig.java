@@ -1,4 +1,4 @@
-package com.snowpeak.game.config;
+package com.snowpeak.game.global.config;
 
 import org.springframework.context.annotation.Configuration;
 import org.springframework.messaging.simp.config.MessageBrokerRegistry;
