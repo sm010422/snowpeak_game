@@ -9,7 +9,7 @@ import lombok.AllArgsConstructor;
 @AllArgsConstructor
 public class PlayerState {
 
-    private String playerId;
+    private String playerId; // This will be the nickname
     private double x;
     private double y;
     private String direction;
