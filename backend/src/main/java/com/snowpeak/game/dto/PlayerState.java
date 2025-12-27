@@ -19,7 +19,8 @@ public class PlayerState {
 
     public enum Role {
         SERVER,
-        BARISTA
+        BARISTA,
+        HALL_SERVER
     }
 
     public enum AnimState {
