@@ -37,7 +37,8 @@ public class GameService {
                 "down",
                 PlayerState.Role.valueOf(message.getRole().toUpperCase()),
                 PlayerState.AnimState.IDLE,
-                ROOM_ID
+                ROOM_ID,
+                "JOIN"
         );
 
         String key = PLAYER_KEY_PREFIX + ROOM_ID;
@@ -75,12 +76,19 @@ public class GameService {
         String key = PLAYER_KEY_PREFIX + ROOM_ID;
 
         if (hashOperations.hasKey(key, nickname)) {
-            // Redis에서 삭제
+            // 1. Redis에서 삭제 (이건 하셨죠?)
             hashOperations.delete(key, nickname);
             
-            // (선택사항) 프론트엔드에게 "누가 나갔어"라고 알려주면 좋습니다.
-            // 여기서는 간단히 로그만 찍거나, 별도의 LEAVE 메시지를 보낼 수 있습니다.
-            System.out.println("Player removed: " + nickname);
+            // 2. ★ 추가할 부분: 다른 사람들에게 "쟤 나갔어(LEAVE)"라고 알려주기
+            PlayerState leaveMessage = new PlayerState();
+            leaveMessage.setPlayerId(nickname);
+            leaveMessage.setRole(PlayerState.Role.HALL_SERVER); // dummy
+            leaveMessage.setStatus("LEAVE"); // ★ 상태를 LEAVE로 설정 (DTO에 필드 추가 필요할 수 있음)
+            
+            String destination = "/topic/room." + ROOM_ID;
+            messagingTemplate.convertAndSend(destination, leaveMessage);
+            
+            System.out.println("Player removed & Broadcasted: " + nickname);
         }
     }
 }

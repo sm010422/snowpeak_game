@@ -17,6 +17,8 @@ public class PlayerState {
     private AnimState animState;
     private String roomId;
 
+    private String status;
+
     public enum Role {
         SERVER,
         BARISTA,
