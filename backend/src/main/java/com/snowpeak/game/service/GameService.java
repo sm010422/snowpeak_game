@@ -28,22 +28,15 @@ public class GameService {
     }
 
     // 1. 플레이어 입장 처리
-// 1. 플레이어 입장 처리
     public void joinPlayer(GameMessage message, String sessionId) {
         // 플레이어 상태 생성
         PlayerState playerState = new PlayerState(
                 message.getNickname(),
                 message.getX(),
                 message.getY(),
-                // message에 direction이 있다면 그것을 사용, 없다면 "down" 기본값
-                message.getDirection() != null ? message.getDirection() : "down", 
-                
-                // ★ 수정된 부분: valueOf() 제거하고 바로 넣기
-                message.getRole(), 
-                
-                // message에 animState가 있다면 그것을 사용, 없다면 IDLE 기본값
-                message.getAnimState() != null ? message.getAnimState() : PlayerState.AnimState.IDLE, 
-                
+                "down",
+                PlayerState.Role.valueOf(message.getRole().toUpperCase()),
+                PlayerState.AnimState.IDLE,
                 ROOM_ID,
                 "JOIN"
         );
@@ -60,7 +53,6 @@ public class GameService {
         // 새로 온 사람에게 "기존에 있던 사람들" 정보 주기
         Map<String, PlayerState> players = hashOperations.entries(key);
         players.values().forEach(ps -> {
-            // 나 자신(방금 들어온 사람)은 제외하고 보냄
             if (!ps.getPlayerId().equals(message.getNickname())) {
                 messagingTemplate.convertAndSendToUser(sessionId, "/queue/players", ps);
             }
