@@ -1,15 +1,19 @@
 package com.snowpeak.game.service;
 
-import com.snowpeak.game.dto.GameMessage;
-import com.snowpeak.game.dto.PlayerState;
-import jakarta.annotation.PostConstruct;
-import lombok.RequiredArgsConstructor;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+
 import org.springframework.data.redis.core.HashOperations;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 
-import java.util.Map;
+import com.snowpeak.game.dto.GameMessage;
+import com.snowpeak.game.dto.PlayerState;
+
+import jakarta.annotation.PostConstruct;
+import lombok.RequiredArgsConstructor;
 
 @Service
 @RequiredArgsConstructor
@@ -90,5 +94,16 @@ public class GameService {
             
             System.out.println("Player removed & Broadcasted: " + nickname);
         }
+    }
+    
+    public List<PlayerState> getAllPlayers(){
+        String key = PLAYER_KEY_PREFIX + ROOM_ID;
+
+        List<PlayerState> playerList = hashOperations.values(key);
+
+        if (playerList == null) {
+            return new ArrayList<>();
+        }
+        return playerList;
     }
 }
