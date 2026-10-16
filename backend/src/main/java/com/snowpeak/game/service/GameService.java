@@ -10,11 +10,16 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.messaging.simp.SimpMessageHeaderAccessor;
 import org.springframework.messaging.simp.SimpMessageType;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Service;
 
+import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 @Slf4j
 @Service
@@ -32,6 +37,10 @@ public class GameService {
 
     private final SimpMessagingTemplate messagingTemplate;
     private final PlayerRepository playerRepository;
+
+    // 아직 Redis 에 저장하지 않은 최신 위치 (roomId → nickname → state)
+    // 이동은 즉시 브로드캐스트하고, Redis 저장은 flushPendingMoves() 가 모아서 처리한다.
+    private final Map<String, Map<String, PlayerState>> pendingMoves = new ConcurrentHashMap<>();
 
     // 1. 플레이어 입장 처리
     public void joinPlayer(GameMessage message, String sessionId, Map<String, Object> sessionAttributes) {
@@ -77,7 +86,7 @@ public class GameService {
         broadcast(roomId, ServerMessage.of(ServerMessage.Type.PLAYER_JOINED, playerState));
     }
 
-    // 2. 플레이어 이동 처리
+    // 2. 플레이어 이동 처리 - Redis 를 기다리지 않고 바로 브로드캐스트
     public void movePlayer(MoveRequest move, Map<String, Object> sessionAttributes) {
         String nickname = (String) sessionAttributes.get(ATTR_NICKNAME);
         String roomId = (String) sessionAttributes.get(ATTR_ROOM_ID);
@@ -94,9 +103,8 @@ public class GameService {
                 "MOVE"
         );
 
-        // 아직 방에 있는 플레이어일 때만 갱신 (퇴장한 플레이어를 되살리지 않음)
-        playerRepository.updateAllIfPresent(roomId, List.of(playerState));
         broadcast(roomId, ServerMessage.of(ServerMessage.Type.MOVE, playerState, move.getSentAt()));
+        pendingMoves.computeIfAbsent(roomId, id -> new ConcurrentHashMap<>()).put(nickname, playerState);
     }
 
     // 3. 플레이어 퇴장 처리 (접속 끊김 시 호출)
@@ -105,14 +113,41 @@ public class GameService {
         String roomId = (String) sessionAttributes.get(ATTR_ROOM_ID);
         if (nickname == null || roomId == null) return;
 
+        Map<String, PlayerState> pending = pendingMoves.get(roomId);
+        if (pending != null) pending.remove(nickname);
+
         if (playerRepository.delete(roomId, nickname)) {
             broadcast(roomId, ServerMessage.of(ServerMessage.Type.PLAYER_LEFT, Map.of("playerId", nickname)));
             log.info("Player removed & broadcasted: {} (room {})", nickname, roomId);
         }
     }
 
+    // 4. 쌓인 최신 위치를 방 단위로 한 번에 Redis 에 저장 (이동 1번마다 HSET 하던 것을 묶음 처리)
+    @Scheduled(fixedDelayString = "${snowpeak.sync.flush-interval-ms:100}")
+    public void flushPendingMoves() {
+        pendingMoves.forEach((roomId, moves) -> {
+            if (moves.isEmpty()) return;
+            Map<String, PlayerState> batch = new HashMap<>(moves);
+            try {
+                playerRepository.updateAllIfPresent(roomId, batch.values());
+                // 저장하는 사이 더 새로운 위치가 들어왔다면 지우지 않고 다음 flush 에 저장
+                batch.forEach(moves::remove);
+            } catch (Exception e) {
+                log.warn("Failed to flush {} moves for room {}: {}", batch.size(), roomId, e.getMessage());
+            }
+        });
+    }
+
+    // Redis 에 저장된 상태 + 아직 저장되지 않은 최신 위치
     public List<PlayerState> getRoomPlayers(String roomId) {
-        return playerRepository.findAll(roomId);
+        Map<String, PlayerState> players = new LinkedHashMap<>();
+        playerRepository.findAll(roomId).forEach(p -> players.put(p.getPlayerId(), p));
+
+        Map<String, PlayerState> pending = pendingMoves.get(roomId);
+        if (pending != null) {
+            pending.forEach((nickname, latest) -> players.computeIfPresent(nickname, (k, v) -> latest));
+        }
+        return new ArrayList<>(players.values());
     }
 
     public void pong(String sessionId, Long sentAt) {
