@@ -1,109 +1,145 @@
 package com.snowpeak.game.service;
 
-import java.util.ArrayList;
-import java.util.List;
-import java.util.Map;
-
-import org.springframework.data.redis.core.HashOperations;
-import org.springframework.data.redis.core.RedisTemplate;
+import com.snowpeak.game.dto.GameMessage;
+import com.snowpeak.game.dto.MoveRequest;
+import com.snowpeak.game.dto.PlayerState;
+import com.snowpeak.game.dto.ServerMessage;
+import com.snowpeak.game.repository.PlayerRepository;
+import lombok.RequiredArgsConstructor;
+import lombok.extern.slf4j.Slf4j;
+import org.springframework.messaging.simp.SimpMessageHeaderAccessor;
+import org.springframework.messaging.simp.SimpMessageType;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.stereotype.Service;
 
-import com.snowpeak.game.dto.GameMessage;
-import com.snowpeak.game.dto.PlayerState;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 
-import jakarta.annotation.PostConstruct;
-import lombok.RequiredArgsConstructor;
-
+@Slf4j
 @Service
 @RequiredArgsConstructor
 public class GameService {
 
+    public static final String DEFAULT_ROOM_ID = "1";
+    public static final String ATTR_NICKNAME = "nickname";
+    public static final String ATTR_ROOM_ID = "roomId";
+    public static final String ATTR_ROLE = "role";
+
+    private static final int MAX_NICKNAME_LENGTH = 16;
+    private static final double MAP_WIDTH = 800;
+    private static final double MAP_HEIGHT = 600;
+
     private final SimpMessagingTemplate messagingTemplate;
-    private final RedisTemplate<String, Object> redisTemplate;
-    private HashOperations<String, String, PlayerState> hashOperations;
-
-    private static final String ROOM_ID = "1";
-    private static final String PLAYER_KEY_PREFIX = "room:";
-
-    @PostConstruct
-    private void init() {
-        hashOperations = redisTemplate.opsForHash();
-    }
+    private final PlayerRepository playerRepository;
 
     // 1. 플레이어 입장 처리
-    public void joinPlayer(GameMessage message, String sessionId) {
-        // 플레이어 상태 생성
+    public void joinPlayer(GameMessage message, String sessionId, Map<String, Object> sessionAttributes) {
+        String nickname = message.getNickname() == null ? "" : message.getNickname().trim();
+        if (nickname.isEmpty() || nickname.length() > MAX_NICKNAME_LENGTH) {
+            sendError(sessionId, "INVALID_NICKNAME", "Nickname must be 1-" + MAX_NICKNAME_LENGTH + " characters");
+            return;
+        }
+
+        Optional<PlayerState.Role> role = PlayerState.Role.from(message.getRole());
+        if (role.isEmpty()) {
+            sendError(sessionId, "INVALID_ROLE", "Unknown role: " + message.getRole());
+            return;
+        }
+
+        String roomId = isBlank(message.getRoomId()) ? DEFAULT_ROOM_ID : message.getRoomId();
         PlayerState playerState = new PlayerState(
-                message.getNickname(),
-                message.getX(),
-                message.getY(),
+                nickname,
+                clamp(message.getX(), MAP_WIDTH),
+                clamp(message.getY(), MAP_HEIGHT),
                 "down",
-                PlayerState.Role.valueOf(message.getRole().toUpperCase()),
+                role.get(),
                 PlayerState.AnimState.IDLE,
-                ROOM_ID,
+                roomId,
                 "JOIN"
         );
 
-        String key = PLAYER_KEY_PREFIX + ROOM_ID;
-        
-        // Redis에 저장
-        hashOperations.put(key, playerState.getPlayerId(), playerState);
+        // HSETNX: 같은 닉네임이 이미 있으면 덮어쓰지 않고 거절
+        if (!playerRepository.saveIfAbsent(playerState)) {
+            sendError(sessionId, "NICKNAME_TAKEN", "Nickname already in use: " + nickname);
+            return;
+        }
 
-        // 다른 사람들에게 "새 친구 왔어!" 알림
-        String destination = "/topic/room." + ROOM_ID;
-        messagingTemplate.convertAndSend(destination, playerState);
+        // 이후 이동/퇴장 메시지는 클라이언트 값이 아니라 이 세션 정보로 처리한다
+        sessionAttributes.put(ATTR_NICKNAME, nickname);
+        sessionAttributes.put(ATTR_ROOM_ID, roomId);
+        sessionAttributes.put(ATTR_ROLE, role.get());
 
-        // 새로 온 사람에게 "기존에 있던 사람들" 정보 주기
-        Map<String, PlayerState> players = hashOperations.entries(key);
-        players.values().forEach(ps -> {
-            if (!ps.getPlayerId().equals(message.getNickname())) {
-                messagingTemplate.convertAndSendToUser(sessionId, "/queue/players", ps);
-            }
-        });
+        // 새로 온 사람에게 현재 방 전체 상태를 한 번에 전달 (본인 세션에만)
+        sendToSession(sessionId, "/queue/sync", ServerMessage.of(ServerMessage.Type.ROOM_STATE, getRoomPlayers(roomId)));
+
+        // 다른 사람들에게 입장 알림
+        broadcast(roomId, ServerMessage.of(ServerMessage.Type.PLAYER_JOINED, playerState));
     }
 
-    // 2. 플레이어 이동/상태 업데이트
-    public void updatePlayer(PlayerState playerState) {
-        String key = PLAYER_KEY_PREFIX + playerState.getRoomId();
-        
-        // Redis 정보 갱신
-        hashOperations.put(key, playerState.getPlayerId(), playerState);
+    // 2. 플레이어 이동 처리
+    public void movePlayer(MoveRequest move, Map<String, Object> sessionAttributes) {
+        String nickname = (String) sessionAttributes.get(ATTR_NICKNAME);
+        String roomId = (String) sessionAttributes.get(ATTR_ROOM_ID);
+        if (nickname == null || roomId == null) return; // 입장하지 않은 세션
 
-        // 모두에게 위치 알림
-        String destination = "/topic/room." + playerState.getRoomId();
-        messagingTemplate.convertAndSend(destination, playerState);
+        PlayerState playerState = new PlayerState(
+                nickname,
+                clamp(move.getX(), MAP_WIDTH),
+                clamp(move.getY(), MAP_HEIGHT),
+                move.getDirection(),
+                (PlayerState.Role) sessionAttributes.get(ATTR_ROLE),
+                move.getAnimState() != null ? move.getAnimState() : PlayerState.AnimState.WALK,
+                roomId,
+                "MOVE"
+        );
+
+        // 아직 방에 있는 플레이어일 때만 갱신 (퇴장한 플레이어를 되살리지 않음)
+        playerRepository.updateAllIfPresent(roomId, List.of(playerState));
+        broadcast(roomId, ServerMessage.of(ServerMessage.Type.MOVE, playerState, move.getSentAt()));
     }
 
-    // 3. ★ 플레이어 퇴장 처리 (접속 끊김 시 호출)
-    public void removePlayer(String nickname) {
-        String key = PLAYER_KEY_PREFIX + ROOM_ID;
+    // 3. 플레이어 퇴장 처리 (접속 끊김 시 호출)
+    public void removePlayer(Map<String, Object> sessionAttributes) {
+        String nickname = (String) sessionAttributes.get(ATTR_NICKNAME);
+        String roomId = (String) sessionAttributes.get(ATTR_ROOM_ID);
+        if (nickname == null || roomId == null) return;
 
-        if (hashOperations.hasKey(key, nickname)) {
-            // 1. Redis에서 삭제 (이건 하셨죠?)
-            hashOperations.delete(key, nickname);
-            
-            // 2. ★ 추가할 부분: 다른 사람들에게 "쟤 나갔어(LEAVE)"라고 알려주기
-            PlayerState leaveMessage = new PlayerState();
-            leaveMessage.setPlayerId(nickname);
-            leaveMessage.setRole(PlayerState.Role.HALL_SERVER); // dummy
-            leaveMessage.setStatus("LEAVE"); // ★ 상태를 LEAVE로 설정 (DTO에 필드 추가 필요할 수 있음)
-            
-            String destination = "/topic/room." + ROOM_ID;
-            messagingTemplate.convertAndSend(destination, leaveMessage);
-            
-            System.out.println("Player removed & Broadcasted: " + nickname);
+        if (playerRepository.delete(roomId, nickname)) {
+            broadcast(roomId, ServerMessage.of(ServerMessage.Type.PLAYER_LEFT, Map.of("playerId", nickname)));
+            log.info("Player removed & broadcasted: {} (room {})", nickname, roomId);
         }
     }
-    
-    public List<PlayerState> getAllPlayers(){
-        String key = PLAYER_KEY_PREFIX + ROOM_ID;
 
-        List<PlayerState> playerList = hashOperations.values(key);
+    public List<PlayerState> getRoomPlayers(String roomId) {
+        return playerRepository.findAll(roomId);
+    }
 
-        if (playerList == null) {
-            return new ArrayList<>();
-        }
-        return playerList;
+    public void pong(String sessionId, Long sentAt) {
+        sendToSession(sessionId, "/queue/pong", ServerMessage.of(ServerMessage.Type.PONG, null, sentAt));
+    }
+
+    private void broadcast(String roomId, ServerMessage message) {
+        messagingTemplate.convertAndSend("/topic/room." + roomId, message);
+    }
+
+    // Principal 이 없는 세션에 1:1 전송 - 세션 ID 헤더가 있어야 /user/queue/** 로 전달된다
+    private void sendToSession(String sessionId, String destination, ServerMessage message) {
+        SimpMessageHeaderAccessor headers = SimpMessageHeaderAccessor.create(SimpMessageType.MESSAGE);
+        headers.setSessionId(sessionId);
+        headers.setLeaveMutable(true);
+        messagingTemplate.convertAndSendToUser(sessionId, destination, message, headers.getMessageHeaders());
+    }
+
+    private void sendError(String sessionId, String code, String message) {
+        sendToSession(sessionId, "/queue/errors", ServerMessage.error(code, message));
+    }
+
+    private static double clamp(double value, double max) {
+        return Math.max(0, Math.min(max, value));
+    }
+
+    private static boolean isBlank(String value) {
+        return value == null || value.trim().isEmpty();
     }
 }
